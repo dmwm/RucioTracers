@@ -318,47 +318,68 @@ func FWJRtrace(msg *stomp.Message) ([]string, error) {
 	return dids, nil
 }
 
+// helper function to subscribe to StompAMQ end-point
+func subscribe(endpoint string) (*stomp.Subscription, error) {
+	p := lbstomp.Config{
+		URI:         Config.StompURI,
+		Login:       Config.StompLogin,
+		Password:    Config.StompPassword,
+		Iterations:  Config.StompIterations,
+		SendTimeout: Config.StompSendTimeout,
+		RecvTimeout: Config.StompRecvTimeout,
+		Endpoint:    Config.EndpointProducer,
+		ContentType: Config.ContentType,
+		Protocol:    Config.Protocol,
+		Verbose:     Config.Verbose,
+	}
+	smgr := lbstomp.New(p)
+	log.Println(smgr.String())
+	// get connection
+	conn, addr, err := smgr.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	log.Println("stomp connection", conn, addr)
+	// subscribe to ActiveMQ topic
+	sub, err := conn.Subscribe(endpoint, stomp.AckAuto)
+	if err != nil {
+		log.Println("unable to subscribe to", endpoint, err)
+		return nil, err
+	}
+	log.Println("stomp subscription", sub)
+	return sub, err
+}
+
+// main server to received/send AMQ messages
 func server() {
 	log.Println("Stomp broker URL: ", Config.StompURI)
-	var err error
-	var addr string
-	var conn *stomp.Conn
-
-	// get connection
-	conn, addr, err = stompMgr.GetConnection()
-	if err != nil {
-		//try again
-		conn, addr, err = stompMgr.GetConnection()
-	}
-	// always close connection
-	//defer conn.Disconnect()
-
-	// subscribe to ActiveMQ topic
-	sub, err2 := conn.Subscribe(Config.EndpointConsumer, stomp.AckAuto)
-	if err2 != nil {
-		sub, err = conn.Subscribe(Config.EndpointConsumer, stomp.AckAuto)
-	}
+	sub, err := subscribe(Config.EndpointConsumer)
 	if err != nil {
 		log.Fatal(err)
-	} else {
-		log.Println("stomp connected to", addr)
 	}
+	log.Println("subscription", sub, err)
 
 	var tc uint64
 	t1 := time.Now().Unix()
 	var t2 int64
-	var ok bool
-	var msg *stomp.Message
 	for {
+		if sub == nil {
+			time.Sleep(time.Duration(Config.Interval) * time.Second)
+			sub, err = subscribe(Config.EndpointConsumer)
+			if err != nil {
+				log.Println("unable to get new subscription", err)
+				continue
+			}
+		}
 		// get stomp messages from subscriber channel
 		select {
-		case msg, ok = <-sub.C:
-			if !ok {
-				conn, addr, err = stompMgr.GetConnection()
-				sub, _ = conn.Subscribe(Config.EndpointConsumer, stomp.AckAuto)
-				msg, ok = <-sub.C
-			}
-			if !ok { //still not get the message, skip this case
+		case msg := <-sub.C:
+			if msg.Err != nil {
+				log.Println("receive error message", msg.Err)
+				sub, err = subscribe(Config.EndpointConsumer)
+				if err != nil {
+					log.Println("unable to subscribe to", Config.EndpointConsumer, err)
+				}
 				break
 			}
 			// process stomp messages
@@ -417,19 +438,9 @@ func main() {
 	// usage: ./stompserver -config stompserverconfig.json -sitemap ruciositemap.json
 
 	atomic.StoreUint64(&msgreceived, 0)
-	//set up roration logs
-	/*
-	logName := "RucioTrace" + "-%Y%m%d"
-	hostname, err := os.Hostname()
-	if err == nil {
-		logName = "RucioTrace" + "-" + hostname + "-%Y%m%d"
-	}
-	rlog, err := rotatelogs.New(logName)
-	if err == nil {
-		log.SetOutput(rlog)
-	}
+	// use this line to print in logs the filename:lineNumber for each log entry
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	*/
+
 	var config string
 	var fsitemap string
 	flag.StringVar(&config, "config", "", "config file name")
