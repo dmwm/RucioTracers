@@ -6,9 +6,13 @@ package main
 
 import (
 	"encoding/json"
+	stomp "github.com/go-stomp/stomp"
+	lbstomp "github.com/vkuznet/lb-stomp"
 	"io/ioutil"
 	"log"
+	"os"
 	"strings"
+	"time"
 )
 
 //
@@ -84,4 +88,110 @@ func parseRSEMap(RSEfile string) error {
 		return err
 	}
 	return nil
+}
+
+// subscribe is a helper function to subscribe to StompAMQ end-point as a listener.
+func subscribe(endpoint string, stompURI string) (*stomp.Subscription, error) {
+	smgr := initStomp(endpoint, stompURI)
+	// get connection
+	conn, addr, err := smgr.GetConnection()
+	if err != nil {
+		return nil, err
+	}
+	log.Println("\n stomp connection", conn, addr)
+	// subscribe to ActiveMQ topic
+	sub, err := conn.Subscribe(endpoint, stomp.AckAuto)
+	if err != nil {
+		log.Println("unable to subscribe to", endpoint, err)
+		return nil, err
+	}
+	log.Println("\n stomp subscription", sub)
+	return sub, err
+}
+
+// initStomp is a function to initialize a stomp object of endpointProducer.
+func initStomp(endpoint string, stompURI string) *lbstomp.StompManager {
+	p := lbstomp.Config{
+		URI:         stompURI,
+		Login:       Config.StompLogin,
+		Password:    Config.StompPassword,
+		Iterations:  Config.StompIterations,
+		SendTimeout: Config.StompSendTimeout,
+		RecvTimeout: Config.StompRecvTimeout,
+		//Endpoint:    Config.EndpointProducer,
+		Endpoint:    endpoint,
+		ContentType: Config.ContentType,
+		Protocol:    Config.Protocol,
+		Verbose:     Config.Verbose,
+	}
+	stompManger := lbstomp.New(p)
+	log.Println(stompManger.String())
+	log.Println(stompManger.Addresses)
+	return stompManger
+}
+
+// subscribeTest is a helper function to subscribe to StompAMQ end-point as a listener.
+func subscribeTest(endpoint string, stompURI string) (*stomp.Subscription, *stomp.Conn, error) {
+	conn, err := stomp.Dial(Config.Protocol, Config.StompURIConsumer,
+		stomp.ConnOpt.Login(Config.StompLogin, Config.StompPassword),
+		stomp.ConnOpt.HeartBeat(time.Duration(Config.StompSendTimeout)*time.Millisecond, time.Duration(Config.StompRecvTimeout)*time.Millisecond),
+		stomp.ConnOpt.HeartBeatGracePeriodMultiplier(float64(Config.Interval)),
+	)
+	if err != nil {
+		log.Printf("Unable to connect to '%s', error %v\n", Config.StompURIConsumer, err)
+	} else {
+		log.Printf("connected to StompAMQ server '%s'\n", Config.StompURIConsumer)
+	}
+	// subscribe to ActiveMQ topic
+	sub, err := conn.Subscribe(endpoint, stomp.AckAuto)
+	if err != nil {
+		log.Println("unable to subscribe to", endpoint, err)
+		err2 := conn.Disconnect()
+		if err2 != nil {
+			log.Println("Disconnection error", err2)
+		}
+		return nil, conn, err
+	}
+	log.Println("\n stomp subscription", sub)
+	return sub, conn, err
+}
+
+func safeSubscribe(endpoint string, stompURI string) (*stomp.Subscription, *stomp.Conn) {
+	iter := 0
+	sub, conn, err := subscribeTest(Config.EndpointConsumer, Config.StompURIConsumer)
+	if err != nil {
+		for iter = 1; iter <= Config.MaxSubTrial; iter++ {
+			log.Println("Subscription unsuccessful: ", err)
+			log.Printf("Could not subscribe, will try in %d seconds\n", time.Duration(Config.Interval)*time.Millisecond)
+			time.Sleep(time.Duration(Config.Interval) * time.Millisecond)
+			sub, conn, err = subscribeTest(Config.EndpointConsumer, Config.StompURIConsumer)
+			if err == nil {
+				break
+			}
+		}
+		if err != nil {
+			err2 := conn.Disconnect()
+			if err2 != nil {
+				log.Println("Disconnection error", err2)
+			}
+			log.Printf("Could not subscribe even until max trials:", Config.MaxSubTrial)
+			log.Printf("Exit!")
+			if err != nil {
+				os.Exit(1)
+			}
+		}
+	}
+	log.Println("Successful subscription, trial:", iter)
+	return sub, conn
+}
+
+func safeUnsubscribe(sub *stomp.Subscription, conn *stomp.Conn) {
+	if err := sub.Unsubscribe(); err != nil {
+		log.Println("Unsubscribe error:", err)
+	}
+	log.Println("Unsubscribed successfully.")
+	if err := conn.Disconnect(); err != nil {
+		log.Println("Disconnection error:", err)
+	}
+	log.Println("Disconnected successfully.")
 }

@@ -13,6 +13,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -187,75 +190,65 @@ func xrtdTrace(msg *stomp.Message) ([]string, error) {
 			log.Println("******** Done Rucio trace record *************")
 		}
 		// send data to Stomp endpoint
-		if Config.EndpointProducer != "" {
-			err := stompMgr.Send(data, stomp.SendOpt.Header("appversion", "xrootdAMQ"))
-			if err != nil {
-				dids = append(dids, fmt.Sprintf("%v", trc.DID))
-				log.Printf("Failed to send %s to stomp.", trc.DID)
-			} else {
-				Send_xrtd.Inc()
-			}
-		} else {
-			log.Fatalln("*** Config.Enpoint is empty, check config file! ***")
-		}
+		//if Config.EndpointProducer != "" {
+		//	err := stompMgr.Send(data, stomp.SendOpt.Header("appversion", "xrootdAMQ"))
+		//	if err != nil {
+		//		dids = append(dids, fmt.Sprintf("%v", trc.DID))
+		//		log.Printf("Failed to send %s to stomp.", trc.DID)
+		//	} else {
+		//		Send_xrtd.Inc()
+		//	}
+		//} else {
+		//	log.Fatalln("*** Config.Enpoint is empty, check config file! ***")
+		//}
 	}
 	return dids, nil
 }
 
+// recoverPanic If there is a failure in xrtdServer, xrtdServer will be started again.
+// xrtdServer can be stopped with only SIGINT signal.
+func recoverPanic() {
+	if r := recover(); r != nil {
+		log.Println("Recovered from ", r)
+		debug.PrintStack()
+		log.Println("Starting xrtdServer again...")
+		xrtdServer()
+	}
+
+}
+
 // xrtdServer gets messages from consumer AMQ end pointer, make tracers and send to AMQ producer end point.
 func xrtdServer() {
-	log.Println("Stomp broker URL: ", Config.StompURIConsumer)
-	// get connection
-	/*
-		sub, err := subscribe(Config.EndpointConsumer, Config.StompURIConsumer)
-		if err != nil {
-			log.Println(err)
-		}
-	*/
-	//
-	err2 := parseRSEMap(fdomainmap)
-	if err2 != nil {
-		log.Fatalf("Unable to parse rucio doamin RSE map file %s, error: %v \n", fdomainmap, err2)
-	}
-
-	err2 = parseSitemap(fsitemap)
-	if err2 != nil {
-		log.Fatalf("Unable to parse rucio sitemap file %s, error: %v \n", fsitemap, err2)
-	}
-
 	var tc uint64
-	t1 := time.Now().Unix()
 	var t2 int64
-	var ts uint64
-	var restartSrv uint
+	t1 := time.Now().Unix()
+	osSigChan := make(chan os.Signal)
+	signal.Notify(osSigChan, os.Interrupt)
+	log.Println("Stomp broker URL: ", Config.StompURIConsumer)
 
+	if err := parseRSEMap(fdomainmap); err != nil {
+		log.Fatalf("Unable to parse rucio doamin RSE map file %s, error: %v \n", fdomainmap, err)
+	}
+
+	if err := parseSitemap(fsitemap); err != nil {
+		log.Fatalf("Unable to parse rucio sitemap file %s, error: %v \n", fsitemap, err)
+	}
+
+	//x := 10
+	// get connection
+	sub, conn := safeSubscribe(Config.EndpointConsumer, Config.StompURIConsumer)
+	defer safeUnsubscribe(sub, conn)
+	defer recoverPanic()
 	for {
-		// get connection
-		sub, err := subscribe(Config.EndpointConsumer, Config.StompURIConsumer)
-		if err != nil {
-			log.Println(err)
-		}
-		// check first if subscription is still valid, otherwise get a new one
-		// We need to connect to the sub
-		if sub == nil {
-			time.Sleep(time.Duration(Config.Interval) * time.Second)
-			sub, err = subscribe(Config.EndpointConsumer, Config.StompURIConsumer)
-			if err != nil {
-				log.Println("unable to get new subscription", err)
-				continue
-			}
-		}
-		// get stomp messages from subscriber channel
 		select {
+		// get stomp messages from subscriber channel
 		case msg := <-sub.C:
-			restartSrv = 0
-			if msg.Err != nil {
+			//x = x - 1
+			//log.Println(10.0 / x)
+			if msg == nil || msg.Err != nil {
 				log.Println("receive error message", msg.Err)
-				sub, err = subscribe(Config.EndpointConsumer, Config.StompURIConsumer)
-				if err != nil {
-					log.Println("unable to subscribe to", Config.EndpointConsumer, err)
-				}
-				break
+				// Skip this message and continue
+				continue
 			}
 			// process stomp messages
 			dids, err := xrtdTrace(msg)
@@ -281,22 +274,10 @@ func xrtdServer() {
 			if len(dids) > 0 {
 				log.Printf("DIDS in Error: %v .\n ", dids)
 			}
-		default:
-			sleep := time.Duration(Config.Interval) * time.Millisecond
-			// Config.Interval = 1 so each sleeping is 10 ms. We will have to restart the server
-			// if it cannot get any messages in 5 minutes.
-			if restartSrv >= 300000 {
-				log.Fatalln("No messages in 5 minutes, exit(1)")
-			}
-			restartSrv += 1
-			if atomic.LoadUint64(&ts) == 10000 {
-				atomic.StoreUint64(&ts, 0)
-				if Config.Verbose > 3 {
-					log.Println("waiting for 10000x", sleep)
-				}
-			}
-			time.Sleep(sleep)
-			atomic.AddUint64(&ts, 1)
+		case exitSig := <-osSigChan:
+			log.Printf("Got %s signal. Aborting...\n", exitSig)
+			safeUnsubscribe(sub, conn)
+			os.Exit(1)
 		}
 	}
 }
